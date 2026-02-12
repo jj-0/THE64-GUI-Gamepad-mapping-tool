@@ -1647,7 +1647,7 @@ static void update_browse(App *app)
                 snprintf(newpath, sizeof(newpath), "%.250s/%.250s",
                          b->path, e->name);
             browser_load(b, newpath);
-        } else if (!e->is_dir && strcmp(e->name, ">> Export here <<") == 0) {
+        } else if (!e->is_dir) {
             /* save to current directory */
             Controller *c = &app->controllers[app->sel_ctrl];
             build_mapping_string(app, app->mapping_str, sizeof(app->mapping_str));
