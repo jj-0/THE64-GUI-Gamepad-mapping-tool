@@ -245,6 +245,12 @@ typedef enum {
     STATE_EXIT
 } AppState;
 
+/* Review screen action items (after the 10 mapping rows) */
+#define REVIEW_ACTION_SAVE    NUM_MAPPINGS       /* index 10 */
+#define REVIEW_ACTION_RESTART (NUM_MAPPINGS + 1) /* index 11 */
+#define REVIEW_ACTION_QUIT    (NUM_MAPPINGS + 2) /* index 12 */
+#define REVIEW_TOTAL_ITEMS    (NUM_MAPPINGS + 3) /* 13 items */
+
 typedef struct {
     Framebuffer  fb;
     AppState     state;
@@ -264,6 +270,9 @@ typedef struct {
     /* navigation repeat */
     int          nav_held_dir;       /* -1=up, 1=down, 0=none */
     uint64_t     nav_repeat_time;
+    /* keyboard input */
+    int          kbd_fds[8];
+    int          num_kbd_fds;
 } App;
 
 static volatile sig_atomic_t g_quit = 0;
@@ -658,6 +667,78 @@ static void drain_events(int fd)
 }
 
 /* ================================================================
+ * Keyboard detection and input
+ * ================================================================ */
+
+static int is_keyboard(int fd)
+{
+    unsigned long evbits[NBITS(EV_MAX)];
+    unsigned long keybits[NBITS(KEY_MAX)];
+
+    memset(evbits, 0, sizeof(evbits));
+    if (ioctl(fd, EVIOCGBIT(0, sizeof(evbits)), evbits) < 0)
+        return 0;
+    if (!TEST_BIT(EV_KEY, evbits))
+        return 0;
+
+    memset(keybits, 0, sizeof(keybits));
+    if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybits)), keybits) < 0)
+        return 0;
+
+    /* Must have letter keys (KEY_Q=16..KEY_P=25) to be a real keyboard */
+    return TEST_BIT(KEY_Q, keybits) && TEST_BIT(KEY_A, keybits);
+}
+
+static void scan_keyboards(App *app)
+{
+    DIR *dir;
+    struct dirent *entry;
+    char path[MAX_PATH_LEN];
+
+    app->num_kbd_fds = 0;
+
+    dir = opendir("/dev/input");
+    if (!dir) return;
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (app->num_kbd_fds >= 8) break;
+        if (strlen(entry->d_name) <= 5) continue;
+        if (strncmp(entry->d_name, "event", 5) != 0) continue;
+
+        snprintf(path, sizeof(path), "/dev/input/%s", entry->d_name);
+        int fd = open(path, O_RDONLY | O_NONBLOCK);
+        if (fd < 0) continue;
+
+        if (is_keyboard(fd)) {
+            app->kbd_fds[app->num_kbd_fds++] = fd;
+        } else {
+            close(fd);
+        }
+    }
+    closedir(dir);
+}
+
+static void close_keyboards(App *app)
+{
+    for (int i = 0; i < app->num_kbd_fds; i++)
+        close(app->kbd_fds[i]);
+    app->num_kbd_fds = 0;
+}
+
+/* Read keyboard events, return key code of pressed key (0 if none) */
+static int read_keyboard(App *app)
+{
+    struct input_event ev;
+    for (int i = 0; i < app->num_kbd_fds; i++) {
+        while (read(app->kbd_fds[i], &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
+            if (ev.type == EV_KEY && ev.value == 1)
+                return ev.code;
+        }
+    }
+    return 0;
+}
+
+/* ================================================================
  * Mapping definitions
  * ================================================================ */
 
@@ -876,25 +957,35 @@ static void browser_load(DirBrowser *b, const char *path)
     if (b->count - start > 1)
         qsort(&b->entries[start], b->count - start, sizeof(DirEntry),
               dir_entry_cmp);
+
+    /* add export action at the end */
+    if (b->count < MAX_DIR_ENTRIES) {
+        snprintf(b->entries[b->count].name, sizeof(b->entries[b->count].name),
+                 ">> Export here <<");
+        b->entries[b->count].is_dir = 0;
+        b->count++;
+    }
 }
 
 /* ================================================================
  * Navigation input (using mapped controls)
  * ================================================================ */
 
-static int read_nav_input(App *app, int *dy, int *btn_a, int *btn_b,
+static int read_nav_input(App *app, int *dy, int *dx, int *btn_a, int *btn_b,
                            int *btn_start)
 {
     Controller *c = &app->controllers[app->sel_ctrl];
     struct input_event ev;
 
-    *dy = 0; *btn_a = 0; *btn_b = 0; *btn_start = 0;
+    *dy = 0; *dx = 0; *btn_a = 0; *btn_b = 0; *btn_start = 0;
 
     while (read(c->fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
         if (ev.type == EV_KEY && ev.value == 1) {
             int idx = c->btn_map[ev.code];
             if (idx < 0) continue;
             /* compare with mapped buttons */
+            if (app->mappings[0].mapped_type == MAP_BUTTON &&
+                idx == app->mappings[0].mapped_index) *btn_a = 1; /* Left Fire = confirm */
             if (app->mappings[4].mapped_type == MAP_BUTTON &&
                 idx == app->mappings[4].mapped_index) *btn_a = 1;
             if (app->mappings[5].mapped_type == MAP_BUTTON &&
@@ -903,8 +994,8 @@ static int read_nav_input(App *app, int *dy, int *btn_a, int *btn_b,
                 idx == app->mappings[7].mapped_index) *btn_start = 1;
         }
         else if (ev.type == EV_ABS) {
-            /* Use whatever was mapped for lefty (index 9) for vertical nav */
-            MappingEntry *my = &app->mappings[9]; /* lefty */
+            /* lefty (index 9) for vertical nav */
+            MappingEntry *my = &app->mappings[9];
             if (my->mapped_type == MAP_AXIS && c->abs_map[ev.code] == my->mapped_index) {
                 int range = c->axis_max[ev.code] - c->axis_min[ev.code];
                 int thresh = range > 0 ? range * 2 / 5 : 1;
@@ -916,17 +1007,22 @@ static int read_nav_input(App *app, int *dy, int *btn_a, int *btn_b,
                 if (ev.value < 0) *dy = -1;
                 else if (ev.value > 0) *dy = 1;
             }
-            /* Also check leftx (index 8) - treat left as btn_b, right as btn_a */
-            MappingEntry *mx = &app->mappings[8]; /* leftx */
+            /* leftx (index 8) for horizontal nav */
+            MappingEntry *mx = &app->mappings[8];
             if (mx->mapped_type == MAP_AXIS && c->abs_map[ev.code] == mx->mapped_index) {
-                /* not used for nav in this version */
+                int range = c->axis_max[ev.code] - c->axis_min[ev.code];
+                int thresh = range > 0 ? range * 2 / 5 : 1;
+                int delta = ev.value - c->axis_initial[ev.code];
+                if (delta < -thresh) *dx = -1;
+                else if (delta > thresh) *dx = 1;
             }
             if (mx->mapped_type == MAP_HAT && c->hat_map[ev.code] == mx->mapped_index) {
-                /* not used for nav */
+                if (ev.value < 0) *dx = -1;
+                else if (ev.value > 0) *dx = 1;
             }
         }
     }
-    return (*dy || *btn_a || *btn_b || *btn_start);
+    return (*dy || *dx || *btn_a || *btn_b || *btn_start);
 }
 
 /* ================================================================
@@ -1130,30 +1226,99 @@ static void render_mapping(App *app)
  * State: review
  * ================================================================ */
 
-static void update_review(App *app)
+/* Helper: redo the currently selected mapping row */
+static void review_redo_selected(App *app)
 {
-    int dy, btn_a, btn_b, btn_start;
-    if (!read_nav_input(app, &dy, &btn_a, &btn_b, &btn_start))
-        return;
-
-    if (dy) {
-        app->review_sel += dy;
-        if (app->review_sel < 0) app->review_sel = 0;
-        if (app->review_sel >= NUM_MAPPINGS) app->review_sel = NUM_MAPPINGS - 1;
-    }
-    if (btn_b) {
-        /* redo the selected mapping */
+    if (app->review_sel >= 0 && app->review_sel < NUM_MAPPINGS) {
         app->redo_single = app->review_sel;
         app->cur_map = app->review_sel;
         app->mappings[app->cur_map].mapped_type = MAP_NONE;
         app->state = STATE_MAPPING;
         drain_events(app->controllers[app->sel_ctrl].fd);
     }
+}
+
+/* Helper: start mapping all over */
+static void review_restart(App *app)
+{
+    init_mappings(app->mappings);
+    app->cur_map = 0;
+    app->redo_single = -1;
+    app->state = STATE_MAPPING;
+    drain_events(app->controllers[app->sel_ctrl].fd);
+}
+
+/* Helper: go to directory browser to save */
+static void review_save(App *app)
+{
+    browser_load(&app->browser, "/mnt");
+    app->state = STATE_BROWSE;
+    drain_events(app->controllers[app->sel_ctrl].fd);
+}
+
+static void update_review(App *app)
+{
+    int dy, dx, btn_a, btn_b, btn_start;
+    int got_ctrl = read_nav_input(app, &dy, &dx, &btn_a, &btn_b, &btn_start);
+
+    /* Keyboard input */
+    int key = read_keyboard(app);
+    if (key == KEY_UP)    dy = -1;
+    if (key == KEY_DOWN)  dy = 1;
+    if (key == KEY_RIGHT) dx = 1;
+    if (key == KEY_1)     { review_redo_selected(app); return; }
+    if (key == KEY_2)     { review_save(app); return; }
+    if (key == KEY_3)     { review_restart(app); return; }
+    if (key == KEY_Q || key == KEY_ESC) { app->state = STATE_EXIT; return; }
+
+    if (!got_ctrl && !key)
+        return;
+
+    /* Vertical navigation */
+    if (dy) {
+        app->review_sel += dy;
+        if (app->review_sel < 0) app->review_sel = 0;
+        if (app->review_sel >= REVIEW_TOTAL_ITEMS)
+            app->review_sel = REVIEW_TOTAL_ITEMS - 1;
+    }
+
+    /* Right on a mapping row (0..9) = redo that mapping */
+    if (dx > 0 && app->review_sel >= 0 && app->review_sel < NUM_MAPPINGS) {
+        review_redo_selected(app);
+        return;
+    }
+
+    /* Confirm on action rows or mapping rows */
+    if (btn_a || key == KEY_ENTER || key == KEY_SPACE) {
+        if (app->review_sel >= 0 && app->review_sel < NUM_MAPPINGS) {
+            /* selecting a mapping row = redo it */
+            review_redo_selected(app);
+            return;
+        }
+        if (app->review_sel == REVIEW_ACTION_SAVE) {
+            review_save(app);
+            return;
+        }
+        if (app->review_sel == REVIEW_ACTION_RESTART) {
+            review_restart(app);
+            return;
+        }
+        if (app->review_sel == REVIEW_ACTION_QUIT) {
+            app->state = STATE_EXIT;
+            return;
+        }
+    }
+
+    /* Shortcut buttons still work regardless of cursor position */
+    if (btn_b) {
+        if (app->review_sel >= 0 && app->review_sel < NUM_MAPPINGS) {
+            review_redo_selected(app);
+            return;
+        }
+    }
     if (btn_start) {
-        /* save */
-        browser_load(&app->browser, "/mnt");
-        app->state = STATE_BROWSE;
-        drain_events(app->controllers[app->sel_ctrl].fd);
+        review_save(app);
+        return;
     }
 }
 
@@ -1225,15 +1390,44 @@ static void render_review(App *app)
         y += 24;
     }
 
-    /* Controls help */
-    y += 20;
-    draw_rect(fb, 50, y, fb->width - 100, 1, COL_BORDER);
+    /* Action buttons */
     y += 12;
-    draw_text(fb, 60, y, "[Up/Down] Navigate   [Menu 2 / B] Redo selected"
-              "   [Menu 4 / Start] Save to file", COL_TEXT_DIM, 1);
+    draw_rect(fb, 50, y, fb->width - 100, 1, COL_BORDER);
+    y += 10;
+
+    {
+        struct { int idx; const char *label; const char *key; uint32_t col; } actions[] = {
+            { REVIEW_ACTION_SAVE,    "Save to File",       "2", COL_SUCCESS },
+            { REVIEW_ACTION_RESTART, "Start Over",         "3", COL_HIGHLIGHT },
+            { REVIEW_ACTION_QUIT,    "Quit Without Saving","Q", COL_ERROR },
+        };
+        for (int i = 0; i < 3; i++) {
+            int hl = (app->review_sel == actions[i].idx);
+            if (hl)
+                draw_rect(fb, 50, y - 2, fb->width - 100, 22, COL_SELECTED);
+            snprintf(buf, sizeof(buf), "[%s] %s", actions[i].key, actions[i].label);
+            draw_text(fb, 70, y, buf,
+                      hl ? COL_TEXT_TITLE : actions[i].col, 1);
+            y += 24;
+        }
+    }
+
+    /* Help */
+    y += 6;
+    draw_rect(fb, 50, y, fb->width - 100, 1, COL_BORDER);
+    y += 8;
+    draw_text(fb, 60, y,
+              "Keyboard: Arrows=Navigate  Right/Enter=Redo  1=Redo sel  "
+              "2=Save  3=Restart  Q=Quit",
+              COL_TEXT_DIM, 1);
+    y += 16;
+    draw_text(fb, 60, y,
+              "Controller: Stick=Navigate  Right=Redo  LFire/A=Confirm  "
+              "B=Redo  Start=Save",
+              COL_TEXT_DIM, 1);
 
     /* GUID and full string */
-    y += 30;
+    y += 24;
     snprintf(buf, sizeof(buf), "GUID: %s",
              app->controllers[app->sel_ctrl].guid);
     draw_text(fb, 60, y, buf, COL_TEXT, 1);
@@ -1263,8 +1457,19 @@ static void render_review(App *app)
 
 static void update_browse(App *app)
 {
-    int dy, btn_a, btn_b, btn_start;
-    if (!read_nav_input(app, &dy, &btn_a, &btn_b, &btn_start))
+    int dy, dx, btn_a, btn_b, btn_start;
+    int got_ctrl = read_nav_input(app, &dy, &dx, &btn_a, &btn_b, &btn_start);
+    (void)dx;
+
+    /* Keyboard input */
+    int key = read_keyboard(app);
+    if (key == KEY_UP)    dy = -1;
+    if (key == KEY_DOWN)  dy = 1;
+    if (key == KEY_ENTER) btn_a = 1;
+    if (key == KEY_LEFT || key == KEY_BACKSPACE) btn_b = 1;
+    if (key == KEY_Q || key == KEY_ESC) btn_start = 1;
+
+    if (!got_ctrl && !key)
         return;
 
     DirBrowser *b = &app->browser;
@@ -1297,6 +1502,26 @@ static void update_browse(App *app)
                 snprintf(newpath, sizeof(newpath), "%.250s/%.250s",
                          b->path, e->name);
             browser_load(b, newpath);
+        } else if (!e->is_dir && strcmp(e->name, ">> Export here <<") == 0) {
+            /* save to current directory */
+            Controller *c = &app->controllers[app->sel_ctrl];
+            build_mapping_string(app, app->mapping_str, sizeof(app->mapping_str));
+
+            char filepath[MAX_PATH_LEN];
+            if (strcmp(b->path, "/") == 0)
+                snprintf(filepath, sizeof(filepath), "/%.32s.txt", c->guid);
+            else
+                snprintf(filepath, sizeof(filepath), "%.470s/%.32s.txt",
+                         b->path, c->guid);
+
+            FILE *fp = fopen(filepath, "w");
+            if (fp) {
+                fprintf(fp, "%s\n", app->mapping_str);
+                fclose(fp);
+                snprintf(app->save_path, sizeof(app->save_path), "%s", filepath);
+                app->state = STATE_DONE;
+            }
+            drain_events(c->fd);
         }
     }
     if (btn_b) {
@@ -1310,26 +1535,9 @@ static void update_browse(App *app)
         browser_load(&app->browser, app->browser.path);
     }
     if (btn_start) {
-        /* save to current directory */
-        Controller *c = &app->controllers[app->sel_ctrl];
-        build_mapping_string(app, app->mapping_str, sizeof(app->mapping_str));
-
-        char filepath[MAX_PATH_LEN];
-        if (strcmp(app->browser.path, "/") == 0)
-            snprintf(filepath, sizeof(filepath), "/%s.txt", c->guid);
-        else
-            snprintf(filepath, sizeof(filepath), "%s/%s.txt",
-                     app->browser.path, c->guid);
-
-        FILE *fp = fopen(filepath, "w");
-        if (fp) {
-            fprintf(fp, "%s\n", app->mapping_str);
-            fclose(fp);
-            snprintf(app->save_path, sizeof(app->save_path), "%s", filepath);
-            app->state = STATE_DONE;
-        }
-        /* if fopen fails, stay in browser (user can navigate elsewhere) */
-        drain_events(c->fd);
+        /* same button that entered the save menu quits it */
+        app->state = STATE_REVIEW;
+        return;
     }
 }
 
@@ -1359,20 +1567,27 @@ static void render_browse(App *app)
 
         if (b->entries[i].is_dir) {
             snprintf(buf, sizeof(buf), "[%s]", b->entries[i].name);
+            draw_text(fb, 70, y, buf, hl ? COL_TEXT_TITLE : COL_TEXT, 1);
         } else {
-            snprintf(buf, sizeof(buf), " %s", b->entries[i].name);
+            /* export action entry */
+            draw_text(fb, 70, y, b->entries[i].name,
+                      hl ? COL_TEXT_TITLE : COL_SUCCESS, 1);
         }
-        draw_text(fb, 70, y, buf, hl ? COL_TEXT_TITLE : COL_TEXT, 1);
         y += 24;
     }
 
     /* Help */
-    int hy = fb->height - 60;
+    int hy = fb->height - 80;
     draw_rect(fb, 50, hy, fb->width - 100, 1, COL_BORDER);
     hy += 12;
     draw_text(fb, 60, hy,
-              "[Up/Down] Navigate  [Menu 1 / A] Enter dir  "
-              "[Menu 2 / B] Go up  [Menu 4 / Start] Export here",
+              "Controller: Up/Down=Navigate  LFire/A=Select  "
+              "B=Go up  Start=Quit",
+              COL_TEXT_DIM, 1);
+    hy += 16;
+    draw_text(fb, 60, hy,
+              "Keyboard: Arrows=Navigate  Enter=Select  "
+              "Left/Bksp=Go up  Q/Esc=Quit",
               COL_TEXT_DIM, 1);
 
     hy += 20;
@@ -1457,6 +1672,7 @@ int main(void)
     app.review_sel = 0;
 
     scan_controllers(&app);
+    scan_keyboards(&app);
     app.last_scan = time_ms();
 
     /* Main loop */
@@ -1502,6 +1718,7 @@ int main(void)
     fb_flip(&app.fb);
 
     close_controllers(&app);
+    close_keyboards(&app);
     fb_destroy(&app.fb);
 
     return 0;
