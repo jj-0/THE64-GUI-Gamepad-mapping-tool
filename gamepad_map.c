@@ -1333,10 +1333,28 @@ static void render_review(App *app)
     draw_text(fb, 16, 10, "Review Mappings", COL_TEXT_TITLE, 1);
 
     int y = 50;
+
+    /* Check for duplicate assignments */
+    int has_dupes = 0;
+    for (int i = 0; i < NUM_MAPPINGS && !has_dupes; i++) {
+        if (app->mappings[i].mapped_type == MAP_NONE) continue;
+        for (int j = i + 1; j < NUM_MAPPINGS; j++) {
+            if (app->mappings[j].mapped_type == app->mappings[i].mapped_type &&
+                app->mappings[j].mapped_index == app->mappings[i].mapped_index &&
+                (app->mappings[i].mapped_type != MAP_HAT ||
+                 app->mappings[j].hat_mask == app->mappings[i].hat_mask)) {
+                has_dupes = 1;
+                break;
+            }
+        }
+    }
+
     /* Column headers */
     draw_text(fb, 60, y, "THE64 Input", COL_TEXT_DIM, 1);
     draw_text(fb, 260, y, "Mapped To", COL_TEXT_DIM, 1);
     draw_text(fb, 460, y, "gamecontrollerdb", COL_TEXT_DIM, 1);
+    if (has_dupes)
+        draw_text(fb, 660, y, "Duplicate Assignment", COL_TEXT_DIM, 1);
 
     y += 24;
     draw_rect(fb, 50, y, fb->width - 100, 1, COL_BORDER);
@@ -1386,6 +1404,25 @@ static void render_review(App *app)
             break;
         }
         draw_text(fb, 460, y, buf, COL_MAPPED, 1);
+
+        /* Show duplicate assignments for this row */
+        if (has_dupes && m->mapped_type != MAP_NONE) {
+            char dups[256] = "";
+            for (int j = 0; j < NUM_MAPPINGS; j++) {
+                if (j == i) continue;
+                if (app->mappings[j].mapped_type == m->mapped_type &&
+                    app->mappings[j].mapped_index == m->mapped_index &&
+                    (m->mapped_type != MAP_HAT ||
+                     app->mappings[j].hat_mask == m->hat_mask)) {
+                    if (dups[0] != '\0')
+                        strncat(dups, ", ", sizeof(dups) - strlen(dups) - 1);
+                    strncat(dups, app->mappings[j].the64_label,
+                            sizeof(dups) - strlen(dups) - 1);
+                }
+            }
+            if (dups[0] != '\0')
+                draw_text(fb, 660, y, dups, COL_ERROR, 1);
+        }
 
         y += 24;
     }
