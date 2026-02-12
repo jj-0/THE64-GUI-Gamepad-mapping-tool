@@ -273,6 +273,8 @@ typedef struct {
     /* keyboard input */
     int          kbd_fds[8];
     int          num_kbd_fds;
+    /* THEJOYSTICK as always-available navigator (-1 = not available) */
+    int          thec64_nav_idx;
 } App;
 
 static volatile sig_atomic_t g_quit = 0;
@@ -666,6 +668,82 @@ static void drain_events(int fd)
         ;
 }
 
+static void drain_nav_events(App *app)
+{
+    drain_events(app->controllers[app->sel_ctrl].fd);
+    if (app->thec64_nav_idx >= 0)
+        drain_events(app->controllers[app->thec64_nav_idx].fd);
+}
+
+/* ================================================================
+ * THEJOYSTICK detection
+ * ================================================================ */
+
+static int is_thec64_joystick(Controller *c)
+{
+    if (strstr(c->name, "THEC64 Joystick") != NULL)
+        return 1;
+    if (strcmp(c->guid, "03000000591c00002300000010010000") == 0)
+        return 1;
+    if (strcmp(c->guid, "03000000591c00002400000010010000") == 0)
+        return 1;
+    return 0;
+}
+
+/* Find THEJOYSTICK among detected controllers (excluding selected one) */
+static void find_thec64_nav(App *app)
+{
+    app->thec64_nav_idx = -1;
+    for (int i = 0; i < app->num_controllers; i++) {
+        if (i == app->sel_ctrl) continue;
+        if (is_thec64_joystick(&app->controllers[i])) {
+            app->thec64_nav_idx = i;
+            return;
+        }
+    }
+}
+
+/* Read THEJOYSTICK navigation input using hardcoded mappings:
+ *   ABS_X (0-255, center 127) → dx
+ *   ABS_Y (0-255, center 127) → dy
+ *   BTN_TRIGGER (288) / BTN_TOP2 (292) → btn_a (Left Fire / Menu 1)
+ *   BTN_PINKIE  (293) → btn_b (Menu 2)
+ *   BTN_BASE2   (295) → btn_start (Menu 4)
+ */
+static int read_thec64_nav(App *app, int *dy, int *dx,
+                           int *btn_a, int *btn_b, int *btn_start)
+{
+    if (app->thec64_nav_idx < 0) return 0;
+    Controller *c = &app->controllers[app->thec64_nav_idx];
+    struct input_event ev;
+    int got = 0;
+
+    while (read(c->fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
+        if (ev.type == EV_KEY && ev.value == 1) {
+            if (ev.code == BTN_TRIGGER || ev.code == BTN_TOP2)
+                { *btn_a = 1; got = 1; }
+            else if (ev.code == BTN_PINKIE)
+                { *btn_b = 1; got = 1; }
+            else if (ev.code == BTN_BASE2)
+                { *btn_start = 1; got = 1; }
+        }
+        else if (ev.type == EV_ABS) {
+            /* ABS_Y → dy, ABS_X → dx  (range 0-255, center ~127) */
+            int delta = ev.value - 127;
+            int thresh = 50; /* ~40% of half-range (127) */
+            if (ev.code == ABS_Y) {
+                if (delta < -thresh) { *dy = -1; got = 1; }
+                else if (delta > thresh) { *dy = 1; got = 1; }
+            }
+            if (ev.code == ABS_X) {
+                if (delta < -thresh) { *dx = -1; got = 1; }
+                else if (delta > thresh) { *dx = 1; got = 1; }
+            }
+        }
+    }
+    return got;
+}
+
 /* ================================================================
  * Keyboard detection and input
  * ================================================================ */
@@ -1022,6 +1100,10 @@ static int read_nav_input(App *app, int *dy, int *dx, int *btn_a, int *btn_b,
             }
         }
     }
+
+    /* Also read THEJOYSTICK if available (merges into same outputs) */
+    read_thec64_nav(app, dy, dx, btn_a, btn_b, btn_start);
+
     return (*dy || *dx || *btn_a || *btn_b || *btn_start);
 }
 
@@ -1096,6 +1178,7 @@ static void update_detect(App *app)
                (ssize_t)sizeof(ev)) {
             if (ev.type == EV_KEY && ev.value == 1) {
                 app->sel_ctrl = i;
+                find_thec64_nav(app);
                 /* drain all controllers */
                 for (int j = 0; j < app->num_controllers; j++)
                     drain_events(app->controllers[j].fd);
@@ -1234,7 +1317,7 @@ static void review_redo_selected(App *app)
         app->cur_map = app->review_sel;
         app->mappings[app->cur_map].mapped_type = MAP_NONE;
         app->state = STATE_MAPPING;
-        drain_events(app->controllers[app->sel_ctrl].fd);
+        drain_nav_events(app);
     }
 }
 
@@ -1245,7 +1328,7 @@ static void review_restart(App *app)
     app->cur_map = 0;
     app->redo_single = -1;
     app->state = STATE_MAPPING;
-    drain_events(app->controllers[app->sel_ctrl].fd);
+    drain_nav_events(app);
 }
 
 /* Helper: go to directory browser to save */
@@ -1253,7 +1336,7 @@ static void review_save(App *app)
 {
     browser_load(&app->browser, "/mnt");
     app->state = STATE_BROWSE;
-    drain_events(app->controllers[app->sel_ctrl].fd);
+    drain_nav_events(app);
 }
 
 static void update_review(App *app)
@@ -1558,7 +1641,7 @@ static void update_browse(App *app)
                 snprintf(app->save_path, sizeof(app->save_path), "%s", filepath);
                 app->state = STATE_DONE;
             }
-            drain_events(c->fd);
+            drain_nav_events(app);
         }
     }
     if (btn_b) {
@@ -1647,6 +1730,16 @@ static void update_done(App *app)
             return;
         }
     }
+    /* Also accept THEJOYSTICK button press to exit */
+    if (app->thec64_nav_idx >= 0) {
+        Controller *t = &app->controllers[app->thec64_nav_idx];
+        while (read(t->fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
+            if (ev.type == EV_KEY && ev.value == 1) {
+                app->state = STATE_EXIT;
+                return;
+            }
+        }
+    }
 }
 
 static void render_done(App *app)
@@ -1705,6 +1798,7 @@ int main(void)
     app.state = STATE_DETECT;
     init_mappings(app.mappings);
     app.sel_ctrl = -1;
+    app.thec64_nav_idx = -1;
     app.redo_single = -1;
     app.review_sel = 0;
 
