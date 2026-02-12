@@ -248,8 +248,9 @@ typedef enum {
 /* Review screen action items (after the 10 mapping rows) */
 #define REVIEW_ACTION_SAVE    NUM_MAPPINGS       /* index 10 */
 #define REVIEW_ACTION_RESTART (NUM_MAPPINGS + 1) /* index 11 */
-#define REVIEW_ACTION_QUIT    (NUM_MAPPINGS + 2) /* index 12 */
-#define REVIEW_TOTAL_ITEMS    (NUM_MAPPINGS + 3) /* 13 items */
+#define REVIEW_ACTION_ANOTHER (NUM_MAPPINGS + 2) /* index 12 */
+#define REVIEW_ACTION_QUIT    (NUM_MAPPINGS + 3) /* index 13 */
+#define REVIEW_TOTAL_ITEMS    (NUM_MAPPINGS + 4) /* 14 items */
 
 typedef struct {
     Framebuffer  fb;
@@ -1352,6 +1353,14 @@ static void update_review(App *app)
     if (key == KEY_1)     { review_redo_selected(app); return; }
     if (key == KEY_2)     { review_save(app); return; }
     if (key == KEY_3)     { review_restart(app); return; }
+    if (key == KEY_4) {
+        init_mappings(app->mappings);
+        app->sel_ctrl = -1;
+        app->thec64_nav_idx = -1;
+        app->state = STATE_DETECT;
+        app->save_path[0] = '\0';
+        return;
+    }
     if (key == KEY_Q || key == KEY_ESC) { app->state = STATE_EXIT; return; }
 
     if (!got_ctrl && !key)
@@ -1384,6 +1393,14 @@ static void update_review(App *app)
         }
         if (app->review_sel == REVIEW_ACTION_RESTART) {
             review_restart(app);
+            return;
+        }
+        if (app->review_sel == REVIEW_ACTION_ANOTHER) {
+            init_mappings(app->mappings);
+            app->sel_ctrl = -1;
+            app->thec64_nav_idx = -1;
+            app->state = STATE_DETECT;
+            app->save_path[0] = '\0';
             return;
         }
         if (app->review_sel == REVIEW_ACTION_QUIT) {
@@ -1517,11 +1534,12 @@ static void render_review(App *app)
 
     {
         struct { int idx; const char *label; const char *key; uint32_t col; } actions[] = {
-            { REVIEW_ACTION_SAVE,    "Save to File",       "2", COL_SUCCESS },
-            { REVIEW_ACTION_RESTART, "Start Over",         "3", COL_HIGHLIGHT },
-            { REVIEW_ACTION_QUIT,    "Quit Without Saving","Q", COL_ERROR },
+            { REVIEW_ACTION_SAVE,    "Save to File",          "2", COL_SUCCESS },
+            { REVIEW_ACTION_RESTART, "Start Over",            "3", COL_HIGHLIGHT },
+            { REVIEW_ACTION_ANOTHER, "Map Another Controller","4", COL_TEXT },
+            { REVIEW_ACTION_QUIT,    "Quit",                  "Q", COL_ERROR },
         };
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 4; i++) {
             int hl = (app->review_sel == actions[i].idx);
             if (hl)
                 draw_rect(fb, 50, y - 2, fb->width - 100, 22, COL_SELECTED);
@@ -1538,13 +1556,20 @@ static void render_review(App *app)
     y += 8;
     draw_text(fb, 60, y,
               "Keyboard: Arrows=Navigate  Right/Enter=Redo  1=Redo sel  "
-              "2=Save  3=Restart  Q=Quit",
+              "2=Save  3=Restart  4=Another  Q=Quit",
               COL_TEXT_DIM, 1);
     y += 16;
     draw_text(fb, 60, y,
               "Controller: Stick=Navigate  Right=Redo  LFire/A=Confirm  "
               "B=Redo  Start=Save",
               COL_TEXT_DIM, 1);
+
+    /* Saved confirmation */
+    if (app->save_path[0] != '\0') {
+        y += 16;
+        snprintf(buf, sizeof(buf), "Saved to: %.200s", app->save_path);
+        draw_text(fb, 60, y, buf, COL_SUCCESS, 1);
+    }
 
     /* GUID and full string */
     y += 24;
@@ -1639,7 +1664,7 @@ static void update_browse(App *app)
                 fprintf(fp, "%s\n", app->mapping_str);
                 fclose(fp);
                 snprintf(app->save_path, sizeof(app->save_path), "%s", filepath);
-                app->state = STATE_DONE;
+                app->state = STATE_REVIEW;
             }
             drain_nav_events(app);
         }
