@@ -1,0 +1,14 @@
+# Rootfs (large binary tree, not our source)
+C64MINIRootfs/
+
+# The64 binary (reference only)
+the64
+
+# Compiled binaries
+gamepad_guid
+gamepad_guid_dynamic
+gamepad_map
+gamepad_map_dynamic
+
+# Claude Code
+.claude/
