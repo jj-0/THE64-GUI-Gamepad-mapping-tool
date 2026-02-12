@@ -735,10 +735,12 @@ static int read_thec64_nav(App *app, int *dy, int *dx,
             if (ev.code == ABS_Y) {
                 if (delta < -thresh) { *dy = -1; got = 1; }
                 else if (delta > thresh) { *dy = 1; got = 1; }
+                else *dy = 0;
             }
             if (ev.code == ABS_X) {
                 if (delta < -thresh) { *dx = -1; got = 1; }
                 else if (delta > thresh) { *dx = 1; got = 1; }
+                else *dx = 0;
             }
         }
     }
@@ -1081,10 +1083,12 @@ static int read_nav_input(App *app, int *dy, int *dx, int *btn_a, int *btn_b,
                 int delta = ev.value - c->axis_initial[ev.code];
                 if (delta < -thresh) *dy = -1;
                 else if (delta > thresh) *dy = 1;
+                else *dy = 0;
             }
             if (my->mapped_type == MAP_HAT && c->hat_map[ev.code] == my->mapped_index) {
                 if (ev.value < 0) *dy = -1;
                 else if (ev.value > 0) *dy = 1;
+                else *dy = 0;
             }
             /* leftx (index 8) for horizontal nav */
             MappingEntry *mx = &app->mappings[8];
@@ -1094,10 +1098,12 @@ static int read_nav_input(App *app, int *dy, int *dx, int *btn_a, int *btn_b,
                 int delta = ev.value - c->axis_initial[ev.code];
                 if (delta < -thresh) *dx = -1;
                 else if (delta > thresh) *dx = 1;
+                else *dx = 0;
             }
             if (mx->mapped_type == MAP_HAT && c->hat_map[ev.code] == mx->mapped_index) {
                 if (ev.value < 0) *dx = -1;
                 else if (ev.value > 0) *dx = 1;
+                else *dx = 0;
             }
         }
     }
