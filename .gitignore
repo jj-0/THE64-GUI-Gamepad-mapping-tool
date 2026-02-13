@@ -6,9 +6,7 @@ the64
 
 # Compiled binaries
 gamepad_guid
-gamepad_guid_dynamic
 gamepad_map
-gamepad_map_dynamic
-
+keyboard2thejoystick
 # Claude Code
 .claude/
