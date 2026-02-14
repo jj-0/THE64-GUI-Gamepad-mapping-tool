@@ -1,3 +1,5 @@
 A GUI tool to run on THE64 Mini, Maxi, VIC-20 that allows you to map a connected USB controller to THEJOYSTICK buttons/axes. Put everything from a Release on the root of an MBR, FAT32 formatted USB stick that you know works on THE64, insert it in a THE64 USB port and run the fake upgrade from it.
 In the menu (after the mapping is done) you can control the menu with the new controller, THEJOYSTICK and also a USB keyboard.
 If you save the mapping a <Controller GUID>.txt file is created on the USB drive with the mapping string that needs to be added to the /usr/share/the64/ui/data/gamecontrollerdb.txt file.
+
+Created using Claude Code
