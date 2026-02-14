@@ -360,9 +360,11 @@ static int g_uinput_fd = -1;
 static int g_kbd_fds[MAX_KEYBOARDS];
 static int g_num_kbd_fds = 0;
 static int g_kbd_grabbed[MAX_KEYBOARDS];
+static int g_ctrl_held;
 
 static void emit_event(int fd, int type, int code, int value);
 static void emit_syn(int fd);
+static int guimap_run(void);
 
 static void sig_handler(int sig)
 {
@@ -415,6 +417,13 @@ static int fb_init(Framebuffer *fb)
     fb->height    = vinfo.yres;
     fb->stride_px = finfo.line_length / (vinfo.bits_per_pixel / 8);
     fb->size      = (size_t)finfo.line_length * vinfo.yres;
+
+    /* Pan display to page 0 so we write to the visible buffer.
+     * Needed after killing the64 which uses EGL double-buffering
+     * and may leave yoffset pointing at a different page. */
+    vinfo.yoffset = 0;
+    vinfo.xoffset = 0;
+    ioctl(fb->fd, FBIOPAN_DISPLAY, &vinfo);
 
     fb->pixels = mmap(NULL, fb->size, PROT_READ | PROT_WRITE, MAP_SHARED,
                        fb->fd, 0);
@@ -794,6 +803,25 @@ static void ungrab_keyboards(void)
 }
 
 /* ================================================================
+ * Suspend translation (for live remap via Ctrl+R)
+ * ================================================================ */
+
+static void suspend_translation(void)
+{
+    for (int b = NUM_DIRECTIONS; b < NUM_MAPPINGS; b++)
+        emit_event(g_uinput_fd, EV_KEY, g_map[b].btn_code, 0);
+    emit_event(g_uinput_fd, EV_ABS, ABS_X, AXIS_CENTER);
+    emit_event(g_uinput_fd, EV_ABS, ABS_Y, AXIS_CENTER);
+    emit_syn(g_uinput_fd);
+    ungrab_keyboards();
+    for (int i = 0; i < g_num_kbd_fds; i++)
+        close(g_kbd_fds[i]);
+    g_num_kbd_fds = 0;
+    memset(g_dir_held, 0, sizeof(g_dir_held));
+    g_ctrl_held = 0;
+}
+
+/* ================================================================
  * Cleanup (atexit safety net)
  * ================================================================ */
 
@@ -952,46 +980,101 @@ static int normal_run(void)
                 g_map[i].label, keycode_to_name(g_map[i].keycode));
     }
     fprintf(stderr, "\nTranslating keyboard input to THEJOYSTICK events...\n");
+    fprintf(stderr, "Press Ctrl+R to remap.\n");
     fprintf(stderr, "Press Ctrl+C to stop.\n\n");
 
-    /* Main event loop */
-    while (!g_quit) {
-        int axis_dirty = 0;
+    /* Outer loop: translate → remap → translate … */
+    for (;;) {
+        int remap_requested = 0;
 
-        for (int k = 0; k < g_num_kbd_fds; k++) {
-            while (read(g_kbd_fds[k], &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
-                if (ev.type != EV_KEY) continue;
-                if (ev.value == 2) continue;  /* skip autorepeat */
+        /* Inner translation loop */
+        while (!g_quit) {
+            int axis_dirty = 0;
 
-                int pressed = (ev.value == 1);
+            for (int k = 0; k < g_num_kbd_fds; k++) {
+                while (read(g_kbd_fds[k], &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
+                    if (ev.type != EV_KEY) continue;
+                    if (ev.value == 2) continue;  /* skip autorepeat */
 
-                /* Check direction mappings */
-                for (int d = 0; d < NUM_DIRECTIONS; d++) {
-                    if (ev.code == g_map[d].keycode) {
-                        if (g_dir_held[d] != pressed) {
-                            g_dir_held[d] = pressed;
-                            axis_dirty = 1;
+                    int pressed = (ev.value == 1);
+
+                    /* Track Ctrl key state */
+                    if (ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL) {
+                        g_ctrl_held = pressed;
+                        continue;
+                    }
+
+                    /* Ctrl+R → request remap */
+                    if (ev.code == KEY_R && pressed && g_ctrl_held) {
+                        remap_requested = 1;
+                        goto break_inner;
+                    }
+
+                    /* Check direction mappings */
+                    for (int d = 0; d < NUM_DIRECTIONS; d++) {
+                        if (ev.code == g_map[d].keycode) {
+                            if (g_dir_held[d] != pressed) {
+                                g_dir_held[d] = pressed;
+                                axis_dirty = 1;
+                            }
+                        }
+                    }
+
+                    /* Check button mappings */
+                    for (int b = NUM_DIRECTIONS; b < NUM_MAPPINGS; b++) {
+                        if (ev.code == g_map[b].keycode) {
+                            emit_event(g_uinput_fd, EV_MSC, MSC_SCAN,
+                                       0x90001 + (g_map[b].btn_code - BTN_TRIGGER));
+                            emit_event(g_uinput_fd, EV_KEY,
+                                       g_map[b].btn_code, pressed);
+                            emit_syn(g_uinput_fd);
                         }
                     }
                 }
-
-                /* Check button mappings */
-                for (int b = NUM_DIRECTIONS; b < NUM_MAPPINGS; b++) {
-                    if (ev.code == g_map[b].keycode) {
-                        emit_event(g_uinput_fd, EV_MSC, MSC_SCAN,
-                                   0x90001 + (g_map[b].btn_code - BTN_TRIGGER));
-                        emit_event(g_uinput_fd, EV_KEY,
-                                   g_map[b].btn_code, pressed);
-                        emit_syn(g_uinput_fd);
-                    }
-                }
             }
+
+            if (axis_dirty)
+                recalc_and_emit_axes();
+
+            usleep(1000);
+        }
+break_inner:
+
+        if (g_quit) break;
+
+        /* Ctrl+R was pressed — enter remap session */
+        fprintf(stderr, "\nCtrl+R pressed, entering remap mode...\n");
+        suspend_translation();
+        system("killall the64");
+
+        /* Save current mappings so we can restore on quit-without-apply */
+        Mapping saved_map[NUM_MAPPINGS];
+        memcpy(saved_map, g_map, sizeof(g_map));
+
+        int remap_result = guimap_run();
+        if (remap_result != 0)
+            memcpy(g_map, saved_map, sizeof(g_map));
+
+        system("/usr/bin/the64 &");
+        usleep(500000);
+
+        /* Print updated configuration */
+        fprintf(stderr, "\nUpdated key mappings:\n");
+        for (int i = 0; i < NUM_MAPPINGS; i++) {
+            fprintf(stderr, "  %-12s = %s\n",
+                    g_map[i].label, keycode_to_name(g_map[i].keycode));
         }
 
-        if (axis_dirty)
-            recalc_and_emit_axes();
+        /* Re-scan and re-grab keyboards */
+        g_num_kbd_fds = scan_keyboards(g_kbd_fds, MAX_KEYBOARDS);
+        grab_keyboards();
+        drain_keyboard_events(g_kbd_fds, g_num_kbd_fds);
 
-        usleep(1000);
+        fprintf(stderr, "\nResuming translation...\n");
+        fprintf(stderr, "Press Ctrl+R to remap.\n");
+        fprintf(stderr, "Press Ctrl+C to stop.\n\n");
+
+        (void)remap_requested;
     }
 
     fprintf(stderr, "\nShutting down...\n");
@@ -1174,12 +1257,11 @@ static void draw_joystick_guimap(Framebuffer *fb, int ox, int oy,
 #define GUIMAP_MAP      0
 #define GUIMAP_REVIEW   1
 #define GUIMAP_BROWSE   2
-#define GUIMAP_DONE     3
 
 /* Review actions after the 16 mapping rows */
-#define GUIMAP_REVIEW_SAVE    NUM_MAPPINGS       /* index 16 */
-#define GUIMAP_REVIEW_REDO    (NUM_MAPPINGS + 1) /* index 17 */
-#define GUIMAP_REVIEW_QUIT    (NUM_MAPPINGS + 2) /* index 18 */
+#define GUIMAP_REVIEW_APPLY   NUM_MAPPINGS       /* index 16 */
+#define GUIMAP_REVIEW_QUIT    (NUM_MAPPINGS + 1) /* index 17 */
+#define GUIMAP_REVIEW_SAVE    (NUM_MAPPINGS + 2) /* index 18 */
 #define GUIMAP_REVIEW_TOTAL   (NUM_MAPPINGS + 3) /* 19 items */
 
 typedef struct {
@@ -1195,7 +1277,92 @@ typedef struct {
     int         kbd_fds[MAX_KEYBOARDS];
     int         num_kbd_fds;
     int         mapped[NUM_MAPPINGS]; /* 1 if this mapping has been set */
+    int         applied;
+    int         joy_fd;       /* real joystick fd, or -1 */
+    int         joy_prev_y;   /* previous Y axis state: -1/0/1 */
 } GuimapApp;
+
+/* ================================================================
+ * Joystick scanning / navigation helpers (for guimap review/browse)
+ * ================================================================ */
+
+static int scan_joystick(void)
+{
+    DIR *dir;
+    struct dirent *entry;
+    char path[MAX_PATH_LEN];
+    char name[MAX_NAME_LEN];
+
+    dir = opendir("/dev/input");
+    if (!dir) return -1;
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (strlen(entry->d_name) <= 5) continue;
+        if (strncmp(entry->d_name, "event", 5) != 0) continue;
+
+        snprintf(path, sizeof(path), "/dev/input/%s", entry->d_name);
+        int fd = open(path, O_RDONLY | O_NONBLOCK);
+        if (fd < 0) continue;
+
+        unsigned long evbits[NBITS(EV_MAX)];
+        unsigned long absbits[NBITS(ABS_MAX)];
+        unsigned long keybits[NBITS(KEY_MAX)];
+        memset(evbits, 0, sizeof(evbits));
+        if (ioctl(fd, EVIOCGBIT(0, sizeof(evbits)), evbits) < 0) {
+            close(fd); continue;
+        }
+        if (!TEST_BIT(EV_ABS, evbits) || !TEST_BIT(EV_KEY, evbits)) {
+            close(fd); continue;
+        }
+        memset(absbits, 0, sizeof(absbits));
+        ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absbits)), absbits);
+        if (!TEST_BIT(ABS_X, absbits) || !TEST_BIT(ABS_Y, absbits)) {
+            close(fd); continue;
+        }
+        memset(keybits, 0, sizeof(keybits));
+        ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybits)), keybits);
+        if (!TEST_BIT(BTN_TRIGGER, keybits)) {
+            close(fd); continue;
+        }
+
+        /* Skip our own virtual joystick */
+        memset(name, 0, sizeof(name));
+        ioctl(fd, EVIOCGNAME(sizeof(name) - 1), name);
+        if (strcmp(name, VDEV_NAME) == 0) {
+            close(fd); continue;
+        }
+
+        closedir(dir);
+        fprintf(stderr, "Found joystick for nav: %s (%s)\n", name, path);
+        return fd;
+    }
+    closedir(dir);
+    return -1;
+}
+
+static void read_joystick_nav(int joy_fd, int *prev_y,
+                               int *nav_dy, int *nav_confirm)
+{
+    struct input_event ev;
+    *nav_dy = 0;
+    *nav_confirm = 0;
+
+    while (read(joy_fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
+        if (ev.type == EV_ABS && ev.code == ABS_Y) {
+            int delta = ev.value - AXIS_CENTER;
+            int cur = 0;
+            if (delta < -50) cur = -1;
+            else if (delta > 50) cur = 1;
+            if (cur != *prev_y) {
+                *nav_dy = cur;
+                *prev_y = cur;
+            }
+        }
+        else if (ev.type == EV_KEY && ev.code == BTN_TRIGGER && ev.value == 1) {
+            *nav_confirm = 1;
+        }
+    }
+}
 
 static void guimap_save_script(GuimapApp *gapp)
 {
@@ -1276,10 +1443,18 @@ static void guimap_render_review(GuimapApp *gapp)
 
     int y = 50;
 
+    /* Scan for duplicate keycodes */
+    int has_dupes = 0;
+    for (int i = 0; i < NUM_MAPPINGS && !has_dupes; i++)
+        for (int j = i + 1; j < NUM_MAPPINGS; j++)
+            if (g_map[j].keycode == g_map[i].keycode) { has_dupes = 1; break; }
+
     /* Column headers */
     draw_text(fb, 60, y, "Action", COL_TEXT_DIM, 1);
     draw_text(fb, 260, y, "Key", COL_TEXT_DIM, 1);
     draw_text(fb, 460, y, "Joystick Output", COL_TEXT_DIM, 1);
+    if (has_dupes)
+        draw_text(fb, 660, y, "Duplicate", COL_ERROR, 1);
 
     y += 24;
     draw_rect(fb, 50, y, fb->width - 100, 1, COL_BORDER);
@@ -1301,6 +1476,18 @@ static void guimap_render_review(GuimapApp *gapp)
             snprintf(buf, sizeof(buf), "BTN_%d", g_map[i].btn_code);
         draw_text(fb, 460, y, buf, COL_TEXT_DIM, 1);
 
+        if (has_dupes) {
+            char dups[256] = "";
+            for (int j = 0; j < NUM_MAPPINGS; j++) {
+                if (j == i) continue;
+                if (g_map[j].keycode == g_map[i].keycode) {
+                    if (dups[0]) strncat(dups, ", ", sizeof(dups) - strlen(dups) - 1);
+                    strncat(dups, g_map[j].label, sizeof(dups) - strlen(dups) - 1);
+                }
+            }
+            if (dups[0]) draw_text(fb, 660, y, dups, COL_ERROR, 1);
+        }
+
         y += 22;
     }
 
@@ -1312,9 +1499,9 @@ static void guimap_render_review(GuimapApp *gapp)
     {
         struct { int idx; const char *label; const char *key; uint32_t col; }
         actions[] = {
-            { GUIMAP_REVIEW_SAVE, "Save to File",  "2", COL_SUCCESS },
-            { GUIMAP_REVIEW_REDO, "Start Over",     "3", COL_HIGHLIGHT },
-            { GUIMAP_REVIEW_QUIT, "Quit",           "Q", COL_ERROR },
+            { GUIMAP_REVIEW_APPLY, "Apply",                  "A", COL_SUCCESS },
+            { GUIMAP_REVIEW_QUIT,  "Quit without Applying",  "Q", COL_ERROR },
+            { GUIMAP_REVIEW_SAVE,  "Save to File",           "S", COL_HIGHLIGHT },
         };
         for (int i = 0; i < 3; i++) {
             int hl = (gapp->review_sel == actions[i].idx);
@@ -1333,8 +1520,8 @@ static void guimap_render_review(GuimapApp *gapp)
     draw_rect(fb, 50, y, fb->width - 100, 1, COL_BORDER);
     y += 8;
     draw_text(fb, 60, y,
-              "Arrows=Navigate  Enter/Space=Select  1=Redo sel  "
-              "2=Save  3=Restart  Q=Quit",
+              "Arrows=Navigate  Enter=Select  1=Redo sel  "
+              "A=Apply  S=Save  Q=Quit",
               COL_TEXT_DIM, 1);
 
     if (gapp->save_path[0] != '\0') {
@@ -1391,41 +1578,6 @@ static void guimap_render_browse(GuimapApp *gapp)
     draw_text(fb, 60, hy, buf, COL_TEXT_DIM, 1);
 }
 
-static void guimap_render_done(GuimapApp *gapp)
-{
-    Framebuffer *fb = &gapp->fb;
-    int cx = fb->width / 2;
-    int y = 100;
-    char buf[512];
-
-    draw_text_centered(fb, cx, y, "Mapping Saved!", COL_SUCCESS, 3);
-
-    y += 80;
-    snprintf(buf, sizeof(buf), "File: %.500s", gapp->save_path);
-    draw_text_centered(fb, cx, y, buf, COL_TEXT, 1);
-
-    y += 40;
-    draw_text(fb, 60, y, "Script contents:", COL_TEXT_DIM, 1);
-    y += 24;
-
-    /* Show generated command */
-    draw_text(fb, 60, y, "#!/bin/sh", COL_TEXT, 1);
-    y += 18;
-    draw_text(fb, 60, y, "exec ./keyboard2thejoystick \\", COL_TEXT, 1);
-    y += 18;
-    for (int i = 0; i < NUM_MAPPINGS; i++) {
-        snprintf(buf, sizeof(buf), "  %s %s%s",
-                 g_map[i].cli_name, keycode_to_name(g_map[i].keycode),
-                 i < NUM_MAPPINGS - 1 ? " \\" : "");
-        draw_text(fb, 60, y, buf, COL_MAPPED, 1);
-        y += 18;
-    }
-
-    y += 20;
-    draw_text_centered(fb, cx, y, "Press any key to exit",
-                        COL_TEXT_DIM, 2);
-}
-
 static int guimap_run(void)
 {
     GuimapApp gapp;
@@ -1451,6 +1603,8 @@ static int guimap_run(void)
     gapp.redo_single = -1;
     gapp.review_sel = 0;
     gapp.blink_time = time_ms();
+    gapp.joy_fd = scan_joystick();
+    gapp.joy_prev_y = 0;
 
     /* Main loop */
     while (!g_quit) {
@@ -1486,11 +1640,16 @@ static int guimap_run(void)
         }
         else if (gapp.state == GUIMAP_REVIEW) {
             int key = read_keyboard_press(gapp.kbd_fds, gapp.num_kbd_fds);
-            if (key == KEY_UP) {
+            int jdy = 0, jconfirm = 0;
+            if (gapp.joy_fd >= 0)
+                read_joystick_nav(gapp.joy_fd, &gapp.joy_prev_y,
+                                  &jdy, &jconfirm);
+
+            if (key == KEY_UP || jdy < 0) {
                 gapp.review_sel--;
                 if (gapp.review_sel < 0) gapp.review_sel = 0;
             }
-            else if (key == KEY_DOWN) {
+            else if (key == KEY_DOWN || jdy > 0) {
                 gapp.review_sel++;
                 if (gapp.review_sel >= GUIMAP_REVIEW_TOTAL)
                     gapp.review_sel = GUIMAP_REVIEW_TOTAL - 1;
@@ -1505,25 +1664,22 @@ static int guimap_run(void)
                     drain_keyboard_events(gapp.kbd_fds, gapp.num_kbd_fds);
                 }
             }
-            else if (key == KEY_2) {
-                /* save */
+            else if (key == KEY_A) {
+                /* apply */
+                gapp.applied = 1;
+                break;
+            }
+            else if (key == KEY_Q || key == KEY_ESC) {
+                /* quit without applying */
+                break;
+            }
+            else if (key == KEY_S) {
+                /* save to file */
                 browser_load(&gapp.browser, "/mnt");
                 gapp.state = GUIMAP_BROWSE;
                 drain_keyboard_events(gapp.kbd_fds, gapp.num_kbd_fds);
             }
-            else if (key == KEY_3) {
-                /* redo all */
-                init_mappings();
-                memset(gapp.mapped, 0, sizeof(gapp.mapped));
-                gapp.cur_map = 0;
-                gapp.redo_single = -1;
-                gapp.state = GUIMAP_MAP;
-                drain_keyboard_events(gapp.kbd_fds, gapp.num_kbd_fds);
-            }
-            else if (key == KEY_Q || key == KEY_ESC) {
-                break;
-            }
-            else if (key == KEY_ENTER || key == KEY_SPACE) {
+            else if (key == KEY_ENTER || key == KEY_SPACE || jconfirm) {
                 if (gapp.review_sel >= 0 &&
                     gapp.review_sel < NUM_MAPPINGS) {
                     gapp.redo_single = gapp.review_sel;
@@ -1531,37 +1687,37 @@ static int guimap_run(void)
                     gapp.state = GUIMAP_MAP;
                     drain_keyboard_events(gapp.kbd_fds, gapp.num_kbd_fds);
                 }
+                else if (gapp.review_sel == GUIMAP_REVIEW_APPLY) {
+                    gapp.applied = 1;
+                    break;
+                }
+                else if (gapp.review_sel == GUIMAP_REVIEW_QUIT) {
+                    break;
+                }
                 else if (gapp.review_sel == GUIMAP_REVIEW_SAVE) {
                     browser_load(&gapp.browser, "/mnt");
                     gapp.state = GUIMAP_BROWSE;
                     drain_keyboard_events(gapp.kbd_fds, gapp.num_kbd_fds);
-                }
-                else if (gapp.review_sel == GUIMAP_REVIEW_REDO) {
-                    init_mappings();
-                    memset(gapp.mapped, 0, sizeof(gapp.mapped));
-                    gapp.cur_map = 0;
-                    gapp.redo_single = -1;
-                    gapp.state = GUIMAP_MAP;
-                    drain_keyboard_events(gapp.kbd_fds, gapp.num_kbd_fds);
-                }
-                else if (gapp.review_sel == GUIMAP_REVIEW_QUIT) {
-                    break;
                 }
             }
         }
         else if (gapp.state == GUIMAP_BROWSE) {
             DirBrowser *b = &gapp.browser;
             int key = read_keyboard_press(gapp.kbd_fds, gapp.num_kbd_fds);
+            int jdy = 0, jconfirm = 0;
+            if (gapp.joy_fd >= 0)
+                read_joystick_nav(gapp.joy_fd, &gapp.joy_prev_y,
+                                  &jdy, &jconfirm);
 
-            if (key == KEY_UP) {
+            if (key == KEY_UP || jdy < 0) {
                 b->selected--;
                 if (b->selected < 0) b->selected = 0;
             }
-            else if (key == KEY_DOWN) {
+            else if (key == KEY_DOWN || jdy > 0) {
                 b->selected++;
                 if (b->selected >= b->count) b->selected = b->count - 1;
             }
-            else if (key == KEY_ENTER) {
+            else if (key == KEY_ENTER || jconfirm) {
                 if (b->count > 0) {
                     DirEntry *e = &b->entries[b->selected];
                     if (strcmp(e->name, "..") == 0) {
@@ -1581,7 +1737,7 @@ static int guimap_run(void)
                     } else {
                         /* Export here */
                         guimap_save_script(&gapp);
-                        gapp.state = GUIMAP_DONE;
+                        gapp.state = GUIMAP_REVIEW;
                         drain_keyboard_events(gapp.kbd_fds,
                                               gapp.num_kbd_fds);
                     }
@@ -1606,11 +1762,6 @@ static int guimap_run(void)
                     b->scroll = b->selected - visible + 1;
             }
         }
-        else if (gapp.state == GUIMAP_DONE) {
-            int key = read_keyboard_press(gapp.kbd_fds, gapp.num_kbd_fds);
-            if (key > 0)
-                break;
-        }
 
         /* Render */
         fb_clear(&gapp.fb, COL_BG);
@@ -1619,7 +1770,6 @@ static int guimap_run(void)
         case GUIMAP_MAP:    guimap_render_map(&gapp);    break;
         case GUIMAP_REVIEW: guimap_render_review(&gapp); break;
         case GUIMAP_BROWSE: guimap_render_browse(&gapp); break;
-        case GUIMAP_DONE:   guimap_render_done(&gapp);   break;
         }
 
         fb_flip(&gapp.fb);
@@ -1630,10 +1780,12 @@ static int guimap_run(void)
     fb_clear(&gapp.fb, 0xFF000000);
     fb_flip(&gapp.fb);
 
+    if (gapp.joy_fd >= 0)
+        close(gapp.joy_fd);
     for (int i = 0; i < gapp.num_kbd_fds; i++)
         close(gapp.kbd_fds[i]);
     fb_destroy(&gapp.fb);
-    return 0;
+    return gapp.applied ? 0 : 1;
 }
 
 /* ================================================================
