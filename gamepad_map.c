@@ -829,9 +829,9 @@ static void init_mappings(MappingEntry *m)
                            "Press LEFT FIRE button",       MAP_NONE, 0, 0};
     m[1] = (MappingEntry){"Right Fire",     "righttrigger", 0,
                            "Press RIGHT FIRE button",      MAP_NONE, 0, 0};
-    m[2] = (MappingEntry){"Left Triangle",  "x", 0,
+    m[2] = (MappingEntry){"Left Triangle",  "y", 0,
                            "Press LEFT TRIANGLE button",   MAP_NONE, 0, 0};
-    m[3] = (MappingEntry){"Right Triangle", "y", 0,
+    m[3] = (MappingEntry){"Right Triangle", "x", 0,
                            "Press RIGHT TRIANGLE button",  MAP_NONE, 0, 0};
     m[4] = (MappingEntry){"Menu 1",         "a", 0,
                            "Press MENU 1 button",          MAP_NONE, 0, 0};
