@@ -1073,7 +1073,8 @@ break_inner:
         /* Ctrl+R was pressed — enter remap session */
         fprintf(stderr, "\nCtrl+R pressed, entering remap mode...\n");
         suspend_translation();
-        system("killall the64");
+        system("killall -9 the64");
+        system("killall -9 the64");
 
         /* Save current mappings so we can restore on quit-without-apply */
         Mapping saved_map[NUM_MAPPINGS];
@@ -1083,8 +1084,8 @@ break_inner:
         if (remap_result != 0)
             memcpy(g_map, saved_map, sizeof(g_map));
 
-        system("/usr/bin/the64 &");
-        usleep(500000);
+        system("the64 &");
+        //usleep(500000);
 
         /* Print updated configuration */
         fprintf(stderr, "\nUpdated key mappings:\n");
