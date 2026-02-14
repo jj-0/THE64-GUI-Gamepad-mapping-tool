@@ -8,7 +8,6 @@ done
 mount -o remount,rw /mnt
 cd /mnt
 
-./switchEGLbuffer 1280 720
 ./gamepad_map
 
 the64 &
