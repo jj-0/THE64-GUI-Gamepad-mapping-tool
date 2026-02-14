@@ -361,6 +361,7 @@ static int g_kbd_fds[MAX_KEYBOARDS];
 static int g_num_kbd_fds = 0;
 static int g_kbd_grabbed[MAX_KEYBOARDS];
 static int g_ctrl_held;
+static int g_suspended;
 
 static void emit_event(int fd, int type, int code, int value);
 static void emit_syn(int fd);
@@ -819,6 +820,7 @@ static void suspend_translation(void)
     g_num_kbd_fds = 0;
     memset(g_dir_held, 0, sizeof(g_dir_held));
     g_ctrl_held = 0;
+    g_suspended = 0;
 }
 
 /* ================================================================
@@ -980,6 +982,7 @@ static int normal_run(void)
                 g_map[i].label, keycode_to_name(g_map[i].keycode));
     }
     fprintf(stderr, "\nTranslating keyboard input to THEJOYSTICK events...\n");
+    fprintf(stderr, "Press Ctrl+S to pause/resume.\n");
     fprintf(stderr, "Press Ctrl+R to remap.\n");
     fprintf(stderr, "Press Ctrl+C to stop.\n\n");
 
@@ -1004,11 +1007,36 @@ static int normal_run(void)
                         continue;
                     }
 
+                    /* Ctrl+S → toggle suspend/resume */
+                    if (ev.code == KEY_S && pressed && g_ctrl_held) {
+                        if (!g_suspended) {
+                            for (int b = NUM_DIRECTIONS; b < NUM_MAPPINGS; b++)
+                                emit_event(g_uinput_fd, EV_KEY, g_map[b].btn_code, 0);
+                            emit_event(g_uinput_fd, EV_ABS, ABS_X, AXIS_CENTER);
+                            emit_event(g_uinput_fd, EV_ABS, ABS_Y, AXIS_CENTER);
+                            emit_syn(g_uinput_fd);
+                            memset(g_dir_held, 0, sizeof(g_dir_held));
+                            ungrab_keyboards();
+                            g_suspended = 1;
+                            fprintf(stderr, "\nJoystick emulation paused (Ctrl+S to resume)\n");
+                        } else {
+                            grab_keyboards();
+                            drain_keyboard_events(g_kbd_fds, g_num_kbd_fds);
+                            g_suspended = 0;
+                            g_ctrl_held = 0;
+                            fprintf(stderr, "\nJoystick emulation resumed (Ctrl+S to pause)\n");
+                        }
+                        continue;
+                    }
+
                     /* Ctrl+R → request remap */
                     if (ev.code == KEY_R && pressed && g_ctrl_held) {
+                        g_suspended = 0;
                         remap_requested = 1;
                         goto break_inner;
                     }
+
+                    if (g_suspended) continue;
 
                     /* Check direction mappings */
                     for (int d = 0; d < NUM_DIRECTIONS; d++) {
@@ -1071,6 +1099,7 @@ break_inner:
         drain_keyboard_events(g_kbd_fds, g_num_kbd_fds);
 
         fprintf(stderr, "\nResuming translation...\n");
+        fprintf(stderr, "Press Ctrl+S to pause/resume.\n");
         fprintf(stderr, "Press Ctrl+R to remap.\n");
         fprintf(stderr, "Press Ctrl+C to stop.\n\n");
 
