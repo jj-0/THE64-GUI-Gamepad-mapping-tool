@@ -329,6 +329,13 @@ static int fb_init(Framebuffer *fb)
     fb->stride_px = finfo.line_length / (vinfo.bits_per_pixel / 8);
     fb->size      = (size_t)finfo.line_length * vinfo.yres;
 
+    /* Pan display to page 0 so we write to the visible buffer.
+     * Needed after killing the64 which uses EGL double-buffering
+     * and may leave yoffset pointing at a different page. */
+    vinfo.yoffset = 0;
+    vinfo.xoffset = 0;
+    ioctl(fb->fd, FBIOPAN_DISPLAY, &vinfo);
+
     fb->pixels = mmap(NULL, fb->size, PROT_READ | PROT_WRITE, MAP_SHARED,
                        fb->fd, 0);
     if (fb->pixels == MAP_FAILED) {
@@ -829,9 +836,9 @@ static void init_mappings(MappingEntry *m)
                            "Press LEFT FIRE button",       MAP_NONE, 0, 0};
     m[1] = (MappingEntry){"Right Fire",     "righttrigger", 0,
                            "Press RIGHT FIRE button",      MAP_NONE, 0, 0};
-    m[2] = (MappingEntry){"Left Triangle",  "x", 0,
+    m[2] = (MappingEntry){"Left Triangle",  "y", 0,
                            "Press LEFT TRIANGLE button",   MAP_NONE, 0, 0};
-    m[3] = (MappingEntry){"Right Triangle", "y", 0,
+    m[3] = (MappingEntry){"Right Triangle", "x", 0,
                            "Press RIGHT TRIANGLE button",  MAP_NONE, 0, 0};
     m[4] = (MappingEntry){"Menu 1",         "a", 0,
                            "Press MENU 1 button",          MAP_NONE, 0, 0};
