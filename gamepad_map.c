@@ -42,6 +42,11 @@
 #define MAX_DIR_ENTRIES   256
 #define GUID_STR_LEN      33
 #define NUM_MAPPINGS       10
+#define IDX_DPLEFT        10   /* extra d-pad button entries (filled when button */
+#define IDX_DPRIGHT       11   /* pressed instead of axis for leftx/lefty slots) */
+#define IDX_DPUP          12
+#define IDX_DPDOWN        13
+#define NUM_MAPPINGS_TOTAL 14
 
 #define FONT_W             8
 #define FONT_H             16
@@ -258,9 +263,10 @@ typedef struct {
     Controller   controllers[MAX_CONTROLLERS];
     int          num_controllers;
     int          sel_ctrl;
-    MappingEntry mappings[NUM_MAPPINGS];
+    MappingEntry mappings[NUM_MAPPINGS_TOTAL];
     int          cur_map;
     int          redo_single;        /* -1 = normal, >=0 = redo that one */
+    int          dpad_submap;        /* -1 = normal, 0 = need dpright, 1 = need dpdown */
     DirBrowser   browser;
     int          blink;
     uint64_t     blink_time;
@@ -852,6 +858,15 @@ static void init_mappings(MappingEntry *m)
                            "Move stick LEFT or RIGHT",     MAP_NONE, 0, 0};
     m[9] = (MappingEntry){"Up/Down",        "lefty", 1,
                            "Move stick UP or DOWN",        MAP_NONE, 0, 0};
+    /* D-pad button overrides – only filled when user presses a button for an axis slot */
+    m[IDX_DPLEFT]  = (MappingEntry){"D-pad Left",  "dpleft",  0,
+                                     "Press LEFT button",  MAP_NONE, 0, 0};
+    m[IDX_DPRIGHT] = (MappingEntry){"D-pad Right", "dpright", 0,
+                                     "Press RIGHT button", MAP_NONE, 0, 0};
+    m[IDX_DPUP]    = (MappingEntry){"D-pad Up",    "dpup",    0,
+                                     "Press UP button",    MAP_NONE, 0, 0};
+    m[IDX_DPDOWN]  = (MappingEntry){"D-pad Down",  "dpdown",  0,
+                                     "Press DOWN button",  MAP_NONE, 0, 0};
 }
 
 /* ================================================================
@@ -883,6 +898,13 @@ static void build_mapping_string(App *app, char *out, size_t sz)
             break;
         }
         pos += snprintf(out + pos, sz - pos, ",");
+    }
+    /* D-pad button overrides */
+    for (int i = IDX_DPLEFT; i < NUM_MAPPINGS_TOTAL; i++) {
+        MappingEntry *m = &app->mappings[i];
+        if (m->mapped_type != MAP_BUTTON) continue;
+        pos += snprintf(out + pos, sz - pos, "%s:b%d,",
+                        m->gcdb_name, m->mapped_index);
     }
     pos += snprintf(out + pos, sz - pos, "platform:Linux,");
     (void)pos;
@@ -947,14 +969,22 @@ static void draw_joystick(Framebuffer *fb, App *app, int ox, int oy)
 
     /* Stick direction labels */
     if (app->state == STATE_MAPPING && app->cur_map == 8) {
-        /* leftx: show L/R arrows */
-        draw_text(fb, ox + 155, oy + 48, "<", COL_HIGHLIGHT, 2);
-        draw_text(fb, ox + 262, oy + 48, ">", COL_HIGHLIGHT, 2);
+        /* leftx: in dpad_submap=0 we already have left, only ask for right */
+        if (app->dpad_submap == 0) {
+            draw_text(fb, ox + 262, oy + 48, ">", COL_HIGHLIGHT, 2);
+        } else {
+            draw_text(fb, ox + 155, oy + 48, "<", COL_HIGHLIGHT, 2);
+            draw_text(fb, ox + 262, oy + 48, ">", COL_HIGHLIGHT, 2);
+        }
     }
     if (app->state == STATE_MAPPING && app->cur_map == 9) {
-        /* lefty: show U/D arrows */
-        draw_text_centered(fb, ox + 220, oy + 15, "^", COL_HIGHLIGHT, 2);
-        draw_text_centered(fb, ox + 220, oy + 185, "v", COL_HIGHLIGHT, 2);
+        /* lefty: in dpad_submap=1 we already have up, only ask for down */
+        if (app->dpad_submap == 1) {
+            draw_text_centered(fb, ox + 220, oy + 185, "v", COL_HIGHLIGHT, 2);
+        } else {
+            draw_text_centered(fb, ox + 220, oy + 15, "^", COL_HIGHLIGHT, 2);
+            draw_text_centered(fb, ox + 220, oy + 185, "v", COL_HIGHLIGHT, 2);
+        }
     }
 
     /* Left triangle button */
@@ -1080,6 +1110,15 @@ static int read_nav_input(App *app, int *dy, int *dx, int *btn_a, int *btn_b,
                 idx == app->mappings[5].mapped_index) *btn_b = 1;
             if (app->mappings[7].mapped_type == MAP_BUTTON &&
                 idx == app->mappings[7].mapped_index) *btn_start = 1;
+            /* dpad buttons for directional navigation */
+            if (app->mappings[IDX_DPLEFT].mapped_type == MAP_BUTTON &&
+                idx == app->mappings[IDX_DPLEFT].mapped_index)  *dx = -1;
+            if (app->mappings[IDX_DPRIGHT].mapped_type == MAP_BUTTON &&
+                idx == app->mappings[IDX_DPRIGHT].mapped_index) *dx =  1;
+            if (app->mappings[IDX_DPUP].mapped_type == MAP_BUTTON &&
+                idx == app->mappings[IDX_DPUP].mapped_index)    *dy = -1;
+            if (app->mappings[IDX_DPDOWN].mapped_type == MAP_BUTTON &&
+                idx == app->mappings[IDX_DPDOWN].mapped_index)  *dy =  1;
         }
         else if (ev.type == EV_ABS) {
             /* lefty (index 9) for vertical nav */
@@ -1199,6 +1238,7 @@ static void update_detect(App *app)
                 app->state = STATE_MAPPING;
                 app->cur_map = 0;
                 app->redo_single = -1;
+                app->dpad_submap = -1;
                 return;
             }
         }
@@ -1238,11 +1278,64 @@ static void render_detect(App *app)
 
 static void update_mapping(App *app)
 {
+    /* --- D-pad submap: waiting for the paired direction button --- */
+    if (app->dpad_submap >= 0) {
+        MappingEntry tmp;
+        memset(&tmp, 0, sizeof(tmp));
+        if (poll_mapping_input(app, &tmp)) {
+            if (tmp.mapped_type == MAP_BUTTON) {
+                drain_events(app->controllers[app->sel_ctrl].fd);
+                usleep(DEBOUNCE_MS * 1000);
+                drain_events(app->controllers[app->sel_ctrl].fd);
+
+                int target = (app->dpad_submap == 0) ? IDX_DPRIGHT : IDX_DPDOWN;
+                app->mappings[target].mapped_type  = MAP_BUTTON;
+                app->mappings[target].mapped_index = tmp.mapped_index;
+                app->dpad_submap = -1;
+
+                if (app->redo_single >= 0) {
+                    app->redo_single = -1;
+                    app->state = STATE_REVIEW;
+                    return;
+                }
+                app->cur_map++;
+                if (app->cur_map >= NUM_MAPPINGS) {
+                    app->state = STATE_REVIEW;
+                    app->review_sel = 0;
+                    build_mapping_string(app, app->mapping_str,
+                                         sizeof(app->mapping_str));
+                }
+            }
+            /* Non-button input during dpad submap is ignored – keep waiting */
+        }
+        return;
+    }
+
+    /* --- Normal mapping --- */
     MappingEntry *m = &app->mappings[app->cur_map];
     if (poll_mapping_input(app, m)) {
         drain_events(app->controllers[app->sel_ctrl].fd);
         usleep(DEBOUNCE_MS * 1000);
         drain_events(app->controllers[app->sel_ctrl].fd);
+
+        /* If an axis slot received a button press, switch to dpad-button mode */
+        if (m->is_axis && m->mapped_type == MAP_BUTTON) {
+            if (app->cur_map == 8) {
+                /* Store as dpleft, clear the axis slot, ask for right */
+                app->mappings[IDX_DPLEFT].mapped_type  = MAP_BUTTON;
+                app->mappings[IDX_DPLEFT].mapped_index = m->mapped_index;
+                m->mapped_type = MAP_NONE;
+                app->dpad_submap = 0;   /* need dpright next */
+                return;
+            } else if (app->cur_map == 9) {
+                /* Store as dpup, clear the axis slot, ask for down */
+                app->mappings[IDX_DPUP].mapped_type  = MAP_BUTTON;
+                app->mappings[IDX_DPUP].mapped_index = m->mapped_index;
+                m->mapped_type = MAP_NONE;
+                app->dpad_submap = 1;   /* need dpdown next */
+                return;
+            }
+        }
 
         if (app->redo_single >= 0) {
             /* was redoing a single mapping, go back to review */
@@ -1270,9 +1363,14 @@ static void render_mapping(App *app)
 
     /* Header bar */
     draw_rect(fb, 0, 0, fb->width, 36, COL_HEADER_BG);
-    snprintf(buf, sizeof(buf), "Mapping: %s (%d/%d)",
-             app->controllers[app->sel_ctrl].name,
-             app->cur_map + 1, NUM_MAPPINGS);
+    if (app->dpad_submap >= 0)
+        snprintf(buf, sizeof(buf), "Mapping: %s (%d+/%d - d-pad button)",
+                 app->controllers[app->sel_ctrl].name,
+                 app->cur_map + 1, NUM_MAPPINGS);
+    else
+        snprintf(buf, sizeof(buf), "Mapping: %s (%d/%d)",
+                 app->controllers[app->sel_ctrl].name,
+                 app->cur_map + 1, NUM_MAPPINGS);
     draw_text(fb, 16, 10, buf, COL_TEXT, 1);
 
     snprintf(buf, sizeof(buf), "GUID: %s", app->controllers[app->sel_ctrl].guid);
@@ -1285,17 +1383,29 @@ static void render_mapping(App *app)
 
     /* Prompt */
     int py = jy + JOY_H + 20;
-    snprintf(buf, sizeof(buf), ">>> %s <<<", m->prompt);
-    draw_text_centered(fb, cx, py, buf, app->blink ? COL_HIGHLIGHT : COL_TEXT, 2);
-
-    /* Sub-label */
-    snprintf(buf, sizeof(buf), "for: %s (%s)", m->the64_label, m->gcdb_name);
-    draw_text_centered(fb, cx, py + 40, buf, COL_TEXT_DIM, 1);
+    if (app->dpad_submap == 0) {
+        snprintf(buf, sizeof(buf), ">>> Press RIGHT button <<<");
+        draw_text_centered(fb, cx, py, buf, app->blink ? COL_HIGHLIGHT : COL_TEXT, 2);
+        draw_text_centered(fb, cx, py + 40, "for: D-pad Right (dpright)",
+                           COL_TEXT_DIM, 1);
+    } else if (app->dpad_submap == 1) {
+        snprintf(buf, sizeof(buf), ">>> Press DOWN button <<<");
+        draw_text_centered(fb, cx, py, buf, app->blink ? COL_HIGHLIGHT : COL_TEXT, 2);
+        draw_text_centered(fb, cx, py + 40, "for: D-pad Down (dpdown)",
+                           COL_TEXT_DIM, 1);
+    } else {
+        snprintf(buf, sizeof(buf), ">>> %s <<<", m->prompt);
+        draw_text_centered(fb, cx, py, buf, app->blink ? COL_HIGHLIGHT : COL_TEXT, 2);
+        /* Sub-label */
+        snprintf(buf, sizeof(buf), "for: %s (%s)", m->the64_label, m->gcdb_name);
+        draw_text_centered(fb, cx, py + 40, buf, COL_TEXT_DIM, 1);
+    }
 
     /* Already mapped summary */
     int sy = py + 70;
     draw_text(fb, 100, sy, "Mapped so far:", COL_TEXT_DIM, 1);
     sy += 20;
+    int row = 0;
     for (int i = 0; i < app->cur_map; i++) {
         MappingEntry *mi = &app->mappings[i];
         switch (mi->mapped_type) {
@@ -1315,7 +1425,16 @@ static void render_mapping(App *app)
             snprintf(buf, sizeof(buf), "  %s = (none)", mi->gcdb_name);
             break;
         }
-        draw_text(fb, 100, sy + i * 18, buf, COL_MAPPED, 1);
+        draw_text(fb, 100, sy + row * 18, buf, COL_MAPPED, 1);
+        row++;
+    }
+    /* Show any dpad entries already captured (during dpad submap) */
+    for (int i = IDX_DPLEFT; i < NUM_MAPPINGS_TOTAL; i++) {
+        MappingEntry *mi = &app->mappings[i];
+        if (mi->mapped_type != MAP_BUTTON) continue;
+        snprintf(buf, sizeof(buf), "  %s = b%d", mi->gcdb_name, mi->mapped_index);
+        draw_text(fb, 100, sy + row * 18, buf, COL_MAPPED, 1);
+        row++;
     }
 }
 
@@ -1330,6 +1449,15 @@ static void review_redo_selected(App *app)
         app->redo_single = app->review_sel;
         app->cur_map = app->review_sel;
         app->mappings[app->cur_map].mapped_type = MAP_NONE;
+        app->dpad_submap = -1;
+        /* If redoing an axis slot, also clear its associated dpad entries */
+        if (app->review_sel == 8) {
+            app->mappings[IDX_DPLEFT].mapped_type  = MAP_NONE;
+            app->mappings[IDX_DPRIGHT].mapped_type = MAP_NONE;
+        } else if (app->review_sel == 9) {
+            app->mappings[IDX_DPUP].mapped_type   = MAP_NONE;
+            app->mappings[IDX_DPDOWN].mapped_type = MAP_NONE;
+        }
         app->state = STATE_MAPPING;
         drain_nav_events(app);
     }
@@ -1341,6 +1469,7 @@ static void review_restart(App *app)
     init_mappings(app->mappings);
     app->cur_map = 0;
     app->redo_single = -1;
+    app->dpad_submap = -1;
     app->state = STATE_MAPPING;
     drain_nav_events(app);
 }
@@ -1370,6 +1499,7 @@ static void update_review(App *app)
         init_mappings(app->mappings);
         app->sel_ctrl = -1;
         app->thec64_nav_idx = -1;
+        app->dpad_submap = -1;
         app->state = STATE_DETECT;
         app->save_path[0] = '\0';
         return;
@@ -1412,6 +1542,7 @@ static void update_review(App *app)
             init_mappings(app->mappings);
             app->sel_ctrl = -1;
             app->thec64_nav_idx = -1;
+            app->dpad_submap = -1;
             app->state = STATE_DETECT;
             app->save_path[0] = '\0';
             return;
@@ -1447,11 +1578,11 @@ static void render_review(App *app)
 
     int y = 50;
 
-    /* Check for duplicate assignments */
+    /* Check for duplicate assignments (include dpad entries) */
     int has_dupes = 0;
-    for (int i = 0; i < NUM_MAPPINGS && !has_dupes; i++) {
+    for (int i = 0; i < NUM_MAPPINGS_TOTAL && !has_dupes; i++) {
         if (app->mappings[i].mapped_type == MAP_NONE) continue;
-        for (int j = i + 1; j < NUM_MAPPINGS; j++) {
+        for (int j = i + 1; j < NUM_MAPPINGS_TOTAL; j++) {
             if (app->mappings[j].mapped_type == app->mappings[i].mapped_type &&
                 app->mappings[j].mapped_index == app->mappings[i].mapped_index &&
                 (app->mappings[i].mapped_type != MAP_HAT ||
@@ -1521,7 +1652,7 @@ static void render_review(App *app)
         /* Show duplicate assignments for this row */
         if (has_dupes && m->mapped_type != MAP_NONE) {
             char dups[256] = "";
-            for (int j = 0; j < NUM_MAPPINGS; j++) {
+            for (int j = 0; j < NUM_MAPPINGS_TOTAL; j++) {
                 if (j == i) continue;
                 if (app->mappings[j].mapped_type == m->mapped_type &&
                     app->mappings[j].mapped_index == m->mapped_index &&
@@ -1538,6 +1669,29 @@ static void render_review(App *app)
         }
 
         y += 24;
+    }
+
+    /* D-pad button entries (shown only when they have been mapped) */
+    {
+        int has_dpad = 0;
+        for (int i = IDX_DPLEFT; i < NUM_MAPPINGS_TOTAL; i++)
+            if (app->mappings[i].mapped_type != MAP_NONE) { has_dpad = 1; break; }
+
+        if (has_dpad) {
+            y += 4;
+            draw_text(fb, 60, y, "D-pad buttons (button-mapped directions):",
+                      COL_TEXT_DIM, 1);
+            y += 18;
+            for (int i = IDX_DPLEFT; i < NUM_MAPPINGS_TOTAL; i++) {
+                MappingEntry *dm = &app->mappings[i];
+                if (dm->mapped_type == MAP_NONE) continue;
+                snprintf(buf, sizeof(buf), "  %s = b%d  (%s:b%d)",
+                         dm->the64_label, dm->mapped_index,
+                         dm->gcdb_name, dm->mapped_index);
+                draw_text(fb, 70, y, buf, COL_MAPPED, 1);
+                y += 18;
+            }
+        }
     }
 
     /* Action buttons */
@@ -1838,6 +1992,7 @@ int main(void)
     app.sel_ctrl = -1;
     app.thec64_nav_idx = -1;
     app.redo_single = -1;
+    app.dpad_submap = -1;
     app.review_sel = 0;
 
     scan_controllers(&app);
