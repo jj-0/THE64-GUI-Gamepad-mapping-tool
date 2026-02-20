@@ -253,12 +253,12 @@ typedef enum {
     STATE_EXIT
 } AppState;
 
-/* Review screen action items (after the 10 mapping rows) */
-#define REVIEW_ACTION_SAVE    NUM_MAPPINGS       /* index 10 */
-#define REVIEW_ACTION_RESTART (NUM_MAPPINGS + 1) /* index 11 */
-#define REVIEW_ACTION_ANOTHER (NUM_MAPPINGS + 2) /* index 12 */
-#define REVIEW_ACTION_QUIT    (NUM_MAPPINGS + 3) /* index 13 */
-#define REVIEW_TOTAL_ITEMS    (NUM_MAPPINGS + 4) /* 14 items */
+/* Review screen action items (after all 14 mapping slots, including dpad) */
+#define REVIEW_ACTION_SAVE    NUM_MAPPINGS_TOTAL       /* index 14 */
+#define REVIEW_ACTION_RESTART (NUM_MAPPINGS_TOTAL + 1) /* index 15 */
+#define REVIEW_ACTION_ANOTHER (NUM_MAPPINGS_TOTAL + 2) /* index 16 */
+#define REVIEW_ACTION_QUIT    (NUM_MAPPINGS_TOTAL + 3) /* index 17 */
+#define REVIEW_TOTAL_ITEMS    (NUM_MAPPINGS_TOTAL + 4) /* 18 items */
 
 typedef struct {
     Framebuffer  fb;
@@ -862,13 +862,13 @@ static void init_mappings(MappingEntry *m)
     m[9] = (MappingEntry){"Up/Down",        "lefty", 1,
                            "Move stick UP or DOWN",        MAP_NONE, 0, 0};
     /* D-pad button overrides – only filled when user presses a button for an axis slot */
-    m[IDX_DPLEFT]  = (MappingEntry){"D-pad Left",  "dpleft",  0,
+    m[IDX_DPLEFT]  = (MappingEntry){"Left",  "dpleft",  0,
                                      "Press LEFT button",  MAP_NONE, 0, 0};
-    m[IDX_DPRIGHT] = (MappingEntry){"D-pad Right", "dpright", 0,
+    m[IDX_DPRIGHT] = (MappingEntry){"Right", "dpright", 0,
                                      "Press RIGHT button", MAP_NONE, 0, 0};
-    m[IDX_DPUP]    = (MappingEntry){"D-pad Up",    "dpup",    0,
+    m[IDX_DPUP]    = (MappingEntry){"Up",    "dpup",    0,
                                      "Press UP button",    MAP_NONE, 0, 0};
-    m[IDX_DPDOWN]  = (MappingEntry){"D-pad Down",  "dpdown",  0,
+    m[IDX_DPDOWN]  = (MappingEntry){"Down",  "dpdown",  0,
                                      "Press DOWN button",  MAP_NONE, 0, 0};
 }
 
@@ -1448,16 +1448,21 @@ static void render_mapping(App *app)
 /* Helper: redo the currently selected mapping row */
 static void review_redo_selected(App *app)
 {
-    if (app->review_sel >= 0 && app->review_sel < NUM_MAPPINGS) {
-        app->redo_single = app->review_sel;
-        app->cur_map = app->review_sel;
-        app->mappings[app->cur_map].mapped_type = MAP_NONE;
+    int sel = app->review_sel;
+    /* Dpad entries redirect to their axis slot */
+    if (sel == IDX_DPLEFT || sel == IDX_DPRIGHT) sel = 8;
+    if (sel == IDX_DPUP   || sel == IDX_DPDOWN)  sel = 9;
+
+    if (sel >= 0 && sel < NUM_MAPPINGS) {
+        app->redo_single = sel;
+        app->cur_map = sel;
+        app->mappings[sel].mapped_type = MAP_NONE;
         app->dpad_submap = -1;
-        /* If redoing an axis slot, also clear its associated dpad entries */
-        if (app->review_sel == 8) {
+        /* Also clear associated dpad entries */
+        if (sel == 8) {
             app->mappings[IDX_DPLEFT].mapped_type  = MAP_NONE;
             app->mappings[IDX_DPRIGHT].mapped_type = MAP_NONE;
-        } else if (app->review_sel == 9) {
+        } else if (sel == 9) {
             app->mappings[IDX_DPUP].mapped_type   = MAP_NONE;
             app->mappings[IDX_DPDOWN].mapped_type = MAP_NONE;
         }
@@ -1512,23 +1517,29 @@ static void update_review(App *app)
     if (!got_ctrl && !key)
         return;
 
-    /* Vertical navigation */
+    /* Vertical navigation – skip unmapped mapping slots */
     if (dy) {
         app->review_sel += dy;
+        /* skip any mapping slot (0..NUM_MAPPINGS_TOTAL-1) that is MAP_NONE */
+        while (app->review_sel >= 0 &&
+               app->review_sel < NUM_MAPPINGS_TOTAL &&
+               app->mappings[app->review_sel].mapped_type == MAP_NONE) {
+            app->review_sel += dy;
+        }
         if (app->review_sel < 0) app->review_sel = 0;
         if (app->review_sel >= REVIEW_TOTAL_ITEMS)
             app->review_sel = REVIEW_TOTAL_ITEMS - 1;
     }
 
-    /* Right on a mapping row (0..9) = redo that mapping */
-    if (dx > 0 && app->review_sel >= 0 && app->review_sel < NUM_MAPPINGS) {
+    /* Right on a mapping row (including dpad) = redo that mapping */
+    if (dx > 0 && app->review_sel >= 0 && app->review_sel < NUM_MAPPINGS_TOTAL) {
         review_redo_selected(app);
         return;
     }
 
     /* Confirm on action rows or mapping rows */
     if (btn_a || key == KEY_ENTER || key == KEY_SPACE) {
-        if (app->review_sel >= 0 && app->review_sel < NUM_MAPPINGS) {
+        if (app->review_sel >= 0 && app->review_sel < NUM_MAPPINGS_TOTAL) {
             /* selecting a mapping row = redo it */
             review_redo_selected(app);
             return;
@@ -1558,7 +1569,7 @@ static void update_review(App *app)
 
     /* Shortcut buttons still work regardless of cursor position */
     if (btn_b) {
-        if (app->review_sel >= 0 && app->review_sel < NUM_MAPPINGS) {
+        if (app->review_sel >= 0 && app->review_sel < NUM_MAPPINGS_TOTAL) {
             review_redo_selected(app);
             return;
         }
