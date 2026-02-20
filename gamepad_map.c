@@ -1607,10 +1607,13 @@ static void render_review(App *app)
     draw_rect(fb, 50, y, fb->width - 100, 1, COL_BORDER);
     y += 8;
 
-    for (int i = 0; i < NUM_MAPPINGS; i++) {
+    /* All mappings in one list: main entries 0-9 plus dpad 10-13,
+       skipping any that are unmapped. */
+    for (int i = 0; i < NUM_MAPPINGS_TOTAL; i++) {
         MappingEntry *m = &app->mappings[i];
-        int hl = (i == app->review_sel);
+        if (m->mapped_type == MAP_NONE) continue;
 
+        int hl = (i == app->review_sel);
         if (hl)
             draw_rect(fb, 50, y - 2, fb->width - 100, 22, COL_SELECTED);
 
@@ -1653,7 +1656,7 @@ static void render_review(App *app)
         draw_text(fb, 460, y, buf, COL_MAPPED, 1);
 
         /* Show duplicate assignments for this row */
-        if (has_dupes && m->mapped_type != MAP_NONE) {
+        if (has_dupes) {
             char dups[256] = "";
             for (int j = 0; j < NUM_MAPPINGS_TOTAL; j++) {
                 if (j == i) continue;
@@ -1672,29 +1675,6 @@ static void render_review(App *app)
         }
 
         y += 24;
-    }
-
-    /* D-pad button entries (shown only when they have been mapped) */
-    {
-        int has_dpad = 0;
-        for (int i = IDX_DPLEFT; i < NUM_MAPPINGS_TOTAL; i++)
-            if (app->mappings[i].mapped_type != MAP_NONE) { has_dpad = 1; break; }
-
-        if (has_dpad) {
-            y += 4;
-            draw_text(fb, 60, y, "D-pad buttons (button-mapped directions):",
-                      COL_TEXT_DIM, 1);
-            y += 18;
-            for (int i = IDX_DPLEFT; i < NUM_MAPPINGS_TOTAL; i++) {
-                MappingEntry *dm = &app->mappings[i];
-                if (dm->mapped_type == MAP_NONE) continue;
-                snprintf(buf, sizeof(buf), "  %s = b%d  (%s:b%d)",
-                         dm->the64_label, dm->mapped_index,
-                         dm->gcdb_name, dm->mapped_index);
-                draw_text(fb, 70, y, buf, COL_MAPPED, 1);
-                y += 18;
-            }
-        }
     }
 
     /* Action buttons */
