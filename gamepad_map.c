@@ -1,3 +1,6 @@
+/* Enable POSIX/GNU extensions (clock_gettime, usleep, strcasecmp) */
+#define _GNU_SOURCE
+
 /*
  * gamepad_map - THEC64 Mini Gamepad Mapping Tool
  *
